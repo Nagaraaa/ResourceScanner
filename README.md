@@ -47,7 +47,7 @@ The final DLL path should be:
 
 ## Download
 
-Compiled releases will be available from the mod's release page. The source code in this repository does not include game assemblies or other third-party binaries.
+Download compiled versions from [GitHub Releases](https://github.com/Nagaraaa/ResourceScanner/releases). The source code in this repository does not include game assemblies or other third-party binaries.
 
 ## Changelog
 
