@@ -1,0 +1,13 @@
+# Build and release artifacts
+bin/
+package/
+*.dll
+*.zip
+
+# Local IDE files
+.vs/
+*.user
+*.suo
+
+# Game dependencies
+references/
