@@ -7,13 +7,18 @@ Select a mineable resource and the mod points you toward the nearest matching de
 ## Features
 
 - Tracks one mineable resource at a time.
+- Builds its selection list from every mineable resource registered by the game, including quartz variants even when none are loaded nearby.
 - Displays only the nearest matching deposit.
-- Shows the resource name and distance on screen.
-- Keeps an edge-of-screen direction indicator when the target is outside the camera view.
+- Ignores deposits that appear to be completely enclosed by terrain or rock geometry.
+- Shows the resource name and distance in a compact status panel that adapts to translated text.
+- Lets the player place that panel in any screen corner from the F7 menu.
+- Uses a small compass-safe marker and keeps a compact direction arrow when the target is outside the camera view.
 - Automatically switches to the next nearest deposit.
 - Searchable in-game resource selection menu.
 - Configurable scan range from 25 to 1,000 metres.
 - Configurable keyboard shortcut, set directly in game.
+- Freezes player camera input while the scanner menu is open.
+- Isolates movement, actions, and game menu shortcuts from scanner text entry.
 - Automatic English and French interface based on the game language.
 - Lightweight scanning with a cached resource list and configurable scan interval.
 
@@ -24,7 +29,7 @@ Resource Scanner is visual only. It does not collect, create, delete, or transfe
 1. Press `F7` by default.
 2. Choose a mineable resource.
 3. Follow the on-screen marker to the nearest matching deposit.
-4. Open the menu again to change the resource, range, shortcut, or stop tracking.
+4. Open the menu again to change the resource, range, shortcut, status position, or stop tracking.
 
 ## Installation
 
@@ -47,7 +52,7 @@ The final DLL path should be:
 
 ## Download
 
-Download compiled versions from [GitHub Releases](https://github.com/Nagaraaa/ResourceScanner/releases). The source code in this repository does not include game assemblies or other third-party binaries.
+Download compiled versions from [GitHub Releases](https://github.com/Nagaraaa/ResourceScanner/releases) or the [Nexus Mods page](https://www.nexusmods.com/planetcrafter/mods/237). The source code in this repository does not include game assemblies or other third-party binaries.
 
 ## Changelog
 

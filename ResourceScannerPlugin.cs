@@ -16,7 +16,7 @@ namespace ResourceScanner
     {
         public const string PluginGuid = "naagara.planetcrafter.resourcescanner";
         public const string PluginName = "Resource Scanner";
-        public const string PluginVersion = "0.1.0";
+        public const string PluginVersion = "0.1.2";
 
         const float CacheRefreshSeconds = 5f;
         const float WindowWidth = 620f;
@@ -28,6 +28,7 @@ namespace ResourceScanner
         static ConfigEntry<float> scanRange;
         static ConfigEntry<float> scanInterval;
         static ConfigEntry<string> selectedResourceId;
+        static ConfigEntry<string> markerAnchor;
 
         static InputAction menuAction;
         static Harmony harmony;
@@ -40,6 +41,8 @@ namespace ResourceScanner
         static readonly List<ActionMinable> cachedMinables = new List<ActionMinable>();
         static readonly List<ResourceChoice> resourceChoices = new List<ResourceChoice>();
         static readonly List<ResourceChoice> filteredChoices = new List<ResourceChoice>();
+        static readonly Collider[] exposureOverlaps = new Collider[24];
+        static readonly Vector3[] exposureSamples = new Vector3[5];
         static ActionMinable currentTarget;
         static float nextCacheRefresh;
         static float nextNearestScan;
@@ -79,9 +82,11 @@ namespace ResourceScanner
             scanRange = Config.Bind("Scanner", "Range", 200f, "Maximum resource detection range in metres.");
             scanInterval = Config.Bind("Scanner", "Interval", 0.75f, "Delay in seconds between nearest-resource checks.");
             selectedResourceId = Config.Bind("Scanner", "SelectedResource", "", "Currently tracked resource group id.");
+            markerAnchor = Config.Bind("Display", "StatusPosition", "TopRight", "Position of the fixed scanner status panel.");
 
             scanRange.Value = Mathf.Clamp(scanRange.Value, 25f, 1000f);
             scanInterval.Value = Mathf.Clamp(scanInterval.Value, 0.25f, 3f);
+            markerAnchor.Value = NormalizeMarkerAnchor(markerAnchor.Value);
             ConfigureMenuAction();
 
             harmony = new Harmony(PluginGuid);
@@ -248,6 +253,7 @@ namespace ResourceScanner
 
         static void OpenMenu()
         {
+            StopPlayerLookAndMovement();
             showingMenu = true;
             capturingKey = false;
             searchText = "";
@@ -261,6 +267,27 @@ namespace ResourceScanner
             showingMenu = false;
             capturingKey = false;
             RestoreCursor();
+        }
+
+        static void StopPlayerLookAndMovement()
+        {
+            var players = Managers.GetManager<PlayersManager>();
+            var player = players == null ? null : players.GetActivePlayerController();
+            if (player == null)
+            {
+                return;
+            }
+            var movable = player.GetPlayerMovable();
+            if (movable != null)
+            {
+                movable.InputOnMove(Vector2.zero);
+                movable.InputOnRun(0f);
+            }
+            var lookable = player.GetPlayerLookable();
+            if (lookable != null)
+            {
+                lookable.InputOnLookDirection(Vector2.zero, false);
+            }
         }
 
         static void SaveAndUnlockCursor()
@@ -304,6 +331,20 @@ namespace ResourceScanner
         static void RebuildResourceChoices()
         {
             var choices = new Dictionary<string, ResourceChoice>(StringComparer.Ordinal);
+            var allGroups = GroupsHandler.GetAllGroups();
+            if (allGroups != null)
+            {
+                foreach (var group in allGroups)
+                {
+                    if (IsMineableGroup(group))
+                    {
+                        AddResourceChoice(choices, group);
+                    }
+                }
+            }
+
+            // Keep loaded instances as a fallback for unusual or dynamically
+            // generated mineables whose group prefab is not directly marked.
             foreach (var minable in cachedMinables)
             {
                 WorldObject worldObject;
@@ -312,20 +353,39 @@ namespace ResourceScanner
                     continue;
                 }
                 var group = worldObject.GetGroup();
-                string id = group.GetId();
-                if (string.IsNullOrEmpty(id) || choices.ContainsKey(id))
-                {
-                    continue;
-                }
-                choices[id] = new ResourceChoice
-                {
-                    Id = id,
-                    Name = SafeGroupName(group)
-                };
+                AddResourceChoice(choices, group);
             }
             resourceChoices.Clear();
             resourceChoices.AddRange(choices.Values);
             resourceChoices.Sort((left, right) => string.Compare(left.Name, right.Name, StringComparison.CurrentCultureIgnoreCase));
+        }
+
+        static bool IsMineableGroup(Group group)
+        {
+            if (group == null)
+            {
+                return false;
+            }
+            var prefab = group.GetAssociatedGameObject();
+            return prefab != null && prefab.GetComponentInChildren<ActionMinable>(true) != null;
+        }
+
+        static void AddResourceChoice(Dictionary<string, ResourceChoice> choices, Group group)
+        {
+            if (group == null)
+            {
+                return;
+            }
+            string id = group.GetId();
+            if (string.IsNullOrEmpty(id) || choices.ContainsKey(id))
+            {
+                return;
+            }
+            choices[id] = new ResourceChoice
+            {
+                Id = id,
+                Name = SafeGroupName(group)
+            };
         }
 
         static bool TryGetWorldObject(ActionMinable minable, out WorldObject worldObject)
@@ -391,6 +451,10 @@ namespace ResourceScanner
                 {
                     continue;
                 }
+                if (!IsLikelyExposed(minable))
+                {
+                    continue;
+                }
                 float distanceSquared = (minable.transform.position - playerPosition).sqrMagnitude;
                 if (distanceSquared <= maxDistanceSquared && distanceSquared < nearestDistanceSquared)
                 {
@@ -399,6 +463,74 @@ namespace ResourceScanner
                 }
             }
             currentTarget = nearest;
+        }
+
+        static bool IsLikelyExposed(ActionMinable minable)
+        {
+            if (minable == null || minable.gameObject == null)
+            {
+                return false;
+            }
+
+            Bounds bounds;
+            var targetCollider = minable.GetComponentInChildren<Collider>();
+            if (targetCollider != null)
+            {
+                bounds = targetCollider.bounds;
+            }
+            else
+            {
+                var targetRenderer = minable.GetComponentInChildren<Renderer>();
+                if (targetRenderer == null)
+                {
+                    // Without bounds data there is no reliable way to decide
+                    // whether this unusual target is embedded, so keep it.
+                    return true;
+                }
+                bounds = targetRenderer.bounds;
+            }
+
+            Vector3 extents = bounds.extents;
+            exposureSamples[0] = bounds.center + Vector3.up * extents.y * 0.9f;
+            exposureSamples[1] = bounds.center + Vector3.right * extents.x * 0.9f;
+            exposureSamples[2] = bounds.center - Vector3.right * extents.x * 0.9f;
+            exposureSamples[3] = bounds.center + Vector3.forward * extents.z * 0.9f;
+            exposureSamples[4] = bounds.center - Vector3.forward * extents.z * 0.9f;
+
+            float smallestExtent = Mathf.Min(extents.x, Mathf.Min(extents.y, extents.z));
+            float probeRadius = Mathf.Clamp(smallestExtent * 0.18f, 0.03f, 0.12f);
+            for (int sampleIndex = 0; sampleIndex < exposureSamples.Length; sampleIndex++)
+            {
+                int overlapCount = Physics.OverlapSphereNonAlloc(
+                    exposureSamples[sampleIndex],
+                    probeRadius,
+                    exposureOverlaps,
+                    Physics.DefaultRaycastLayers,
+                    QueryTriggerInteraction.Ignore);
+                bool blockedByEnvironment = false;
+                for (int hitIndex = 0; hitIndex < overlapCount; hitIndex++)
+                {
+                    Collider hit = exposureOverlaps[hitIndex];
+                    exposureOverlaps[hitIndex] = null;
+                    if (hit == null)
+                    {
+                        continue;
+                    }
+                    // Mineable colliders, including neighbouring deposits, do
+                    // not represent terrain or a rock hiding this resource.
+                    if (hit.GetComponentInParent<ActionMinable>() != null)
+                    {
+                        continue;
+                    }
+                    blockedByEnvironment = true;
+                    break;
+                }
+                if (!blockedByEnvironment)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         void OnGUI()
@@ -455,21 +587,27 @@ namespace ResourceScanner
                 }
             }
 
+            GUI.Label(new Rect(24f, 158f, 105f, 28f), T("position"), bodyStyle);
+            if (GUI.Button(new Rect(130f, 154f, 265f, 31f), GetMarkerAnchorLabel(), buttonStyle))
+            {
+                CycleMarkerAnchor();
+            }
+
             bool isTracking = !string.IsNullOrEmpty(selectedResourceId.Value);
             string selectedName = GetSelectedResourceName();
-            GUI.Label(new Rect(24f, 158f, width - 180f, 28f), isTracking ? string.Format(T("tracking"), selectedName) : T("notTracking"), bodyStyle);
-            if (isTracking && GUI.Button(new Rect(width - 165f, 154f, 140f, 32f), T("stop"), buttonStyle))
+            GUI.Label(new Rect(24f, 198f, width - 180f, 28f), isTracking ? string.Format(T("tracking"), selectedName) : T("notTracking"), bodyStyle);
+            if (isTracking && GUI.Button(new Rect(width - 165f, 194f, 140f, 32f), T("stop"), buttonStyle))
             {
                 selectedResourceId.Value = "";
                 currentTarget = null;
                 instance.Config.Save();
             }
 
-            GUI.Label(new Rect(24f, 204f, 90f, 28f), T("search"), bodyStyle);
+            GUI.Label(new Rect(24f, 240f, 90f, 28f), T("search"), bodyStyle);
             GUI.SetNextControlName("ResourceScannerSearch");
-            searchText = GUI.TextField(new Rect(115f, 201f, width - 140f, 32f), searchText, textFieldStyle);
+            searchText = GUI.TextField(new Rect(115f, 237f, width - 140f, 32f), searchText, textFieldStyle);
 
-            Rect listRect = new Rect(24f, 248f, width - 48f, height - 316f);
+            Rect listRect = new Rect(24f, 280f, width - 48f, height - 348f);
             var displayed = GetDisplayedChoices();
             float contentHeight = Mathf.Max(listRect.height - 4f, displayed.Count * 40f + 8f);
             scrollPosition = GUI.BeginScrollView(listRect, scrollPosition, new Rect(0f, 0f, listRect.width - 18f, contentHeight));
@@ -492,7 +630,7 @@ namespace ResourceScanner
 
             if (displayed.Count == 0)
             {
-                GUI.Label(new Rect(40f, 270f, width - 80f, 60f), T("noResources"), mutedStyle);
+                GUI.Label(new Rect(40f, 302f, width - 80f, 60f), T("noResources"), mutedStyle);
             }
             if (GUI.Button(new Rect(width - 165f, height - 52f, 140f, 34f), T("close"), buttonStyle))
             {
@@ -557,19 +695,20 @@ namespace ResourceScanner
                 return;
             }
 
+            string compactName = CompactResourceName(resourceName);
             if (currentTarget == null)
             {
-                string noSignal = string.Format(T("noSignal"), resourceName, (int)scanRange.Value, GetMenuKeyLabel());
-                GUI.Label(new Rect((Screen.width - 440f) * 0.5f, 24f, 440f, 38f), noSignal, statusStyle);
+                string noSignal = compactName + "  •  " + string.Format(T("noneShort"), (int)scanRange.Value);
+                DrawStatusPanel(noSignal);
                 return;
             }
 
             float distance = Vector3.Distance(player.transform.position, currentTarget.transform.position);
-            string label = resourceName + "  •  " + Mathf.RoundToInt(distance) + " m";
+            DrawStatusPanel(compactName + "  •  " + Mathf.RoundToInt(distance) + " m");
+
             Camera camera = Camera.main;
             if (camera == null)
             {
-                GUI.Label(new Rect((Screen.width - 320f) * 0.5f, 24f, 320f, 38f), label, statusStyle);
                 return;
             }
 
@@ -583,17 +722,23 @@ namespace ResourceScanner
                 y = Screen.height - y;
             }
 
-            const float halfWidth = 105f;
-            const float halfHeight = 22f;
-            bool onScreen = !behind && x >= halfWidth && x <= Screen.width - halfWidth && y >= 70f && y <= Screen.height - halfHeight;
+            const float halfWidth = 20f;
+            const float halfHeight = 18f;
+            const float compassSafeBottom = 118f;
+            const float bottomSafeMargin = 68f;
+            bool onScreen = !behind
+                && x >= halfWidth + 12f
+                && x <= Screen.width - halfWidth - 12f
+                && y >= compassSafeBottom
+                && y <= Screen.height - halfHeight - bottomSafeMargin;
             if (onScreen)
             {
-                GUI.Label(new Rect(x - halfWidth, y - halfHeight, halfWidth * 2f, halfHeight * 2f), "◆  " + label, markerStyle);
+                GUI.Label(new Rect(x - halfWidth, y - halfHeight, halfWidth * 2f, halfHeight * 2f), "◆", markerStyle);
                 return;
             }
 
             float clampedX = Mathf.Clamp(x, halfWidth + 12f, Screen.width - halfWidth - 12f);
-            float clampedY = Mathf.Clamp(y, 78f, Screen.height - halfHeight - 16f);
+            float clampedY = Mathf.Clamp(y, compassSafeBottom, Screen.height - halfHeight - bottomSafeMargin);
             Vector2 direction = new Vector2(x - Screen.width * 0.5f, y - Screen.height * 0.5f);
             string arrow;
             if (Mathf.Abs(direction.x) > Mathf.Abs(direction.y))
@@ -604,7 +749,81 @@ namespace ResourceScanner
             {
                 arrow = direction.y < 0f ? "^" : "v";
             }
-            GUI.Label(new Rect(clampedX - halfWidth, clampedY - halfHeight, halfWidth * 2f, halfHeight * 2f), arrow + "  " + label, markerStyle);
+            GUI.Label(new Rect(clampedX - halfWidth, clampedY - halfHeight, halfWidth * 2f, halfHeight * 2f), arrow, markerStyle);
+        }
+
+        static void DrawStatusPanel(string text)
+        {
+            Rect rect = GetStatusRect(text);
+            GUI.DrawTexture(rect, markerTexture);
+            GUI.DrawTexture(new Rect(rect.x, rect.y, 3f, rect.height), selectedTexture);
+            GUI.Label(new Rect(rect.x + 12f, rect.y, rect.width - 20f, rect.height), text, statusStyle);
+        }
+
+        static Rect GetStatusRect(string text)
+        {
+            const float sideMargin = 18f;
+            const float topMargin = 88f;
+            const float height = 34f;
+            string anchor = NormalizeMarkerAnchor(markerAnchor.Value);
+            bool right = anchor.EndsWith("Right", StringComparison.Ordinal);
+            bool bottom = anchor.StartsWith("Bottom", StringComparison.Ordinal);
+
+            float maximumWidth = Mathf.Max(120f, Mathf.Min(380f, Screen.width - sideMargin * 2f));
+            float minimumWidth = Mathf.Min(210f, maximumWidth);
+            float measuredWidth = statusStyle.CalcSize(new GUIContent(text)).x + 34f;
+            float width = Mathf.Clamp(measuredWidth, minimumWidth, maximumWidth);
+            float bottomMargin = right ? 102f : 184f;
+            float x = right ? Screen.width - width - sideMargin : sideMargin;
+            float y = bottom ? Screen.height - height - bottomMargin : topMargin;
+            return new Rect(x, y, width, height);
+        }
+
+        static string CompactResourceName(string resourceName)
+        {
+            const int maximumLength = 26;
+            if (string.IsNullOrEmpty(resourceName) || resourceName.Length <= maximumLength)
+            {
+                return resourceName;
+            }
+            return resourceName.Substring(0, maximumLength - 3) + "...";
+        }
+
+        static string NormalizeMarkerAnchor(string anchor)
+        {
+            switch (anchor)
+            {
+                case "TopLeft":
+                case "TopRight":
+                case "BottomLeft":
+                case "BottomRight":
+                    return anchor;
+                default:
+                    return "TopRight";
+            }
+        }
+
+        static void CycleMarkerAnchor()
+        {
+            switch (NormalizeMarkerAnchor(markerAnchor.Value))
+            {
+                case "TopRight": markerAnchor.Value = "BottomRight"; break;
+                case "BottomRight": markerAnchor.Value = "BottomLeft"; break;
+                case "BottomLeft": markerAnchor.Value = "TopLeft"; break;
+                default: markerAnchor.Value = "TopRight"; break;
+            }
+            instance.Config.Save();
+        }
+
+        static string GetMarkerAnchorLabel()
+        {
+            switch (NormalizeMarkerAnchor(markerAnchor.Value))
+            {
+                case "TopLeft": return T("topLeft");
+                case "BottomLeft": return T("bottomLeft");
+                case "BottomRight": return T("bottomRight");
+                default: return T("topRight");
+            }
         }
 
         static string GetMenuKeyLabel()
@@ -652,13 +871,18 @@ namespace ResourceScanner
                 case "shortcut": return english ? "Shortcut" : "Raccourci";
                 case "pressKey": return english ? "Press a keyboard key (Esc to cancel)" : "Appuie sur une touche (Echap pour annuler)";
                 case "change": return english ? "Change" : "Modifier";
+                case "position": return english ? "Status" : "Position";
+                case "topLeft": return english ? "Top left" : "En haut a gauche";
+                case "topRight": return english ? "Top right" : "En haut a droite";
+                case "bottomLeft": return english ? "Bottom left" : "En bas a gauche";
+                case "bottomRight": return english ? "Bottom right" : "En bas a droite";
                 case "tracking": return english ? "Tracking: {0}" : "Suivi : {0}";
                 case "notTracking": return english ? "No resource selected" : "Aucune ressource selectionnee";
                 case "stop": return english ? "Stop tracking" : "Arreter le suivi";
                 case "search": return english ? "Search" : "Chercher";
                 case "noResources": return english ? "No mineable resource is currently loaded nearby." : "Aucune ressource minable n'est actuellement chargee a proximite.";
                 case "close": return english ? "Close" : "Fermer";
-                case "noSignal": return english ? "{0}: no deposit within {1} m  •  {2} to change" : "{0} : aucun gisement a moins de {1} m  •  {2} pour changer";
+                case "noneShort": return english ? "none < {0} m" : "aucun < {0} m";
                 case "unknown": return english ? "Unknown" : "Inconnu";
                 default: return key;
             }
@@ -685,7 +909,7 @@ namespace ResourceScanner
             buttonHoverTexture = MakeTexture(new Color(0.10f, 0.34f, 0.44f, 1f));
             selectedTexture = MakeTexture(new Color(0.08f, 0.48f, 0.58f, 1f));
             fieldTexture = MakeTexture(new Color(0.015f, 0.035f, 0.055f, 1f));
-            markerTexture = MakeTexture(new Color(0.02f, 0.08f, 0.12f, 0.92f));
+            markerTexture = MakeTexture(new Color(0.02f, 0.08f, 0.12f, 0.86f));
 
             panelStyle = new GUIStyle(GUI.skin.box)
             {
@@ -738,15 +962,19 @@ namespace ResourceScanner
             };
             markerStyle = new GUIStyle(GUI.skin.label)
             {
-                fontSize = 16,
+                fontSize = 19,
                 fontStyle = FontStyle.Bold,
                 alignment = TextAnchor.MiddleCenter,
                 normal = { background = markerTexture, textColor = new Color(0.48f, 0.94f, 1f, 1f) }
             };
-            statusStyle = new GUIStyle(markerStyle)
+            statusStyle = new GUIStyle(GUI.skin.label)
             {
-                fontSize = 14,
-                wordWrap = false
+                fontSize = 13,
+                fontStyle = FontStyle.Bold,
+                alignment = TextAnchor.MiddleLeft,
+                wordWrap = false,
+                clipping = TextClipping.Clip,
+                normal = { textColor = new Color(0.48f, 0.94f, 1f, 1f) }
             };
         }
 
@@ -755,34 +983,29 @@ namespace ResourceScanner
         {
             static IEnumerable<MethodBase> TargetMethods()
             {
-                string[] names =
+                foreach (var method in typeof(PlayerInputDispatcher).GetMethods(
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
                 {
-                    "OnActionDispatcher",
-                    "OnAutoForwardDispatcher",
-                    "OnBlockViewDispatcher",
-                    "OnCancelActionDispatcher",
-                    "OnCloseUiDispatcher",
-                    "OnEscapeDispatcher",
-                    "OnMoveDispatcher",
-                    "OnOpenConstructionDispatcher",
-                    "OnOpenInventoryDispatcher",
-                    "OnPhotoModeDispatcher",
-                    "OnPressEnterDispatcher",
-                    "OnRotateObjectDispatcher",
-                    "OnShowMapDispatcher",
-                    "OnToggleLightDispatcher",
-                    "OnUnstuckDispatcher"
-                };
-                foreach (string name in names)
-                {
-                    MethodInfo method = AccessTools.Method(typeof(PlayerInputDispatcher), name);
-                    if (method != null)
+                    if (method.Name == "OnDestroy")
+                    {
+                        continue;
+                    }
+                    if (method.Name == "Update" || method.Name.StartsWith("On", StringComparison.Ordinal))
                     {
                         yield return method;
                     }
                 }
             }
 
+            static bool Prefix()
+            {
+                return !showingMenu;
+            }
+        }
+
+        [HarmonyPatch(typeof(PlayerLookable), "Update")]
+        static class FreezePlayerViewWhileMenuOpen
+        {
             static bool Prefix()
             {
                 return !showingMenu;
